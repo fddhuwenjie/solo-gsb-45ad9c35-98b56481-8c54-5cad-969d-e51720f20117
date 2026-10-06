@@ -18,6 +18,7 @@ from .models import (
     KeyDeactivationEvent,
     QuotaStatus,
     RedemptionEvent,
+    ReservationEvent,
     RevocationEvent,
     RevocationImpact,
 )
@@ -176,6 +177,33 @@ CREATE TABLE IF NOT EXISTS redemption_quotas (
     subject    TEXT PRIMARY KEY,
     limit_value INTEGER,
     updated_at TEXT NOT NULL
+);
+
+-- 单链访问的短时额度预留（成功预留才落库；只追加，消费时仅回填消费标记）。
+-- reservation_key 全局唯一（重放/冲突判定）；同一令牌的有效预留（未过期、未消费）
+-- 至多一笔，由应用层在 BEGIN IMMEDIATE 事务内检查兜底（过期自动释放后允许再预留）。
+-- 有效预留按 subject 占一份额度：普通单链核销 / 会签 / 新预留只能动用
+-- available = limit - used - reserved，调低额度不得低于 used + reserved。
+CREATE TABLE IF NOT EXISTS quota_reservations (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    reservation_key TEXT NOT NULL UNIQUE,
+    chain_id       TEXT NOT NULL,
+    token_id       TEXT NOT NULL,
+    subject        TEXT NOT NULL,
+    request_path   TEXT NOT NULL,
+    method         TEXT NOT NULL,
+    source_ip      TEXT,
+    request_body   TEXT,
+    access_sha256  TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    ttl_seconds    INTEGER NOT NULL,
+    evaluated_at   TEXT NOT NULL,
+    expires_at     TEXT NOT NULL,
+    created_at     TEXT NOT NULL,
+    consumed_at    TEXT,
+    redemption_request_key TEXT,
+    result_json    TEXT NOT NULL,
+    FOREIGN KEY (chain_id) REFERENCES chains (chain_id)
 );
 """
 
@@ -1073,18 +1101,31 @@ def load_quota_row(
     return row["limit_value"], datetime.fromisoformat(row["updated_at"])
 
 
-def get_quota_status(conn: sqlite3.Connection, subject: str) -> QuotaStatus:
-    """组装主体的额度口径（额度 / 已用量 / 剩余量）；未设置额度时 limit 为 None。"""
+def get_quota_status(
+    conn: sqlite3.Connection, subject: str, now: datetime | None = None
+) -> QuotaStatus:
+    """组装主体的额度口径（额度 / 历史已用 / 有效预留 / 可用量）。
+
+    - ``used``：成功单链核销 + 会签参与侧（含额度设置前的历史用量）；
+    - ``reserved``：当前有效（未过期、未消费）的短时预留份数，按 ``now``
+      （缺省为当前时刻）判定过期——过期预留自动释放，无需后台任务；
+    - ``remaining = limit - used``；``available = limit - used - reserved``；
+      未设置额度（不限额）时两者均为 None。
+    """
     row = load_quota_row(conn, subject)
     limit = row[0] if row is not None else None
     updated_at = row[1] if row is not None else None
     used = count_subject_redemption_usage(conn, subject)
+    reserved = count_active_reservations(conn, subject, now)
     remaining = None if limit is None else limit - used
+    available = None if limit is None else remaining - reserved
     return QuotaStatus(
         subject=subject,
         limit=limit,
         used=used,
         remaining=remaining,
+        reserved=reserved,
+        available=available,
         updated_at=updated_at,
     )
 
@@ -1098,7 +1139,7 @@ def upsert_quota(
     """设置 / 调整 / 清除主体额度（UPSERT），返回调整前的额度（未设置为 None）。
 
     调用方须先在同一 ``BEGIN IMMEDIATE`` 事务内以 :func:`get_quota_status`
-    校验新额度不低于当前已用量；本函数只负责落库。
+    校验新额度不低于当前已用量与有效预留之和；本函数只负责落库。
     """
     previous_row = load_quota_row(conn, subject)
     previous_limit = previous_row[0] if previous_row is not None else None
@@ -1110,3 +1151,141 @@ def upsert_quota(
         (subject, limit, updated_at.astimezone(timezone.utc).isoformat()),
     )
     return previous_limit
+
+
+# --------------------------------------------------------------------------- #
+# 单链访问的短时额度预留（成功预留才落库；过期自动释放，消费只回填标记）
+# --------------------------------------------------------------------------- #
+_RESERVATION_COLUMNS = (
+    "reservation_key, chain_id, token_id, subject, request_path, method, "
+    "source_ip, request_body, access_sha256, content_sha256, ttl_seconds, "
+    "evaluated_at, expires_at, created_at, consumed_at, redemption_request_key"
+)
+
+
+def insert_reservation(
+    conn: sqlite3.Connection, event: ReservationEvent, result_json: str
+) -> None:
+    """追加一条短时预留记录；reservation_key 唯一约束冲突时抛 IntegrityError。"""
+    conn.execute(
+        "INSERT INTO quota_reservations (reservation_key, chain_id, token_id, "
+        "subject, request_path, method, source_ip, request_body, access_sha256, "
+        "content_sha256, ttl_seconds, evaluated_at, expires_at, created_at, "
+        "consumed_at, redemption_request_key, result_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            event.reservation_key,
+            event.chain_id,
+            event.token_id,
+            event.subject,
+            event.request_path,
+            event.method,
+            event.source_ip,
+            json.dumps(event.request_body, ensure_ascii=False),
+            event.access_sha256,
+            event.content_sha256,
+            event.ttl_seconds,
+            event.evaluated_at.astimezone(timezone.utc).isoformat(),
+            event.expires_at.astimezone(timezone.utc).isoformat(),
+            event.created_at.astimezone(timezone.utc).isoformat(),
+            None,
+            None,
+            result_json,
+        ),
+    )
+
+
+def load_reservation_by_key(
+    conn: sqlite3.Connection, reservation_key: str
+) -> tuple[ReservationEvent, str] | None:
+    """返回（预留事件, 首次响应 JSON）；未见过该 reservation_key 时返回 None。"""
+    row = conn.execute(
+        f"SELECT {_RESERVATION_COLUMNS}, result_json FROM quota_reservations "
+        "WHERE reservation_key = ?",
+        (reservation_key,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _reservation_from_row(row), row["result_json"]
+
+
+def load_active_reservation_for_token(
+    conn: sqlite3.Connection,
+    chain_id: str,
+    token_id: str,
+    now: datetime | None = None,
+) -> ReservationEvent | None:
+    """该令牌当前有效（未过期、未消费）的预留；无则返回 None。
+
+    同一令牌至多一笔有效预留（创建时在 BEGIN IMMEDIATE 事务内检查）；
+    过期预留自动释放，不视为有效。
+    """
+    at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
+    row = conn.execute(
+        f"SELECT {_RESERVATION_COLUMNS} FROM quota_reservations "
+        "WHERE chain_id = ? AND token_id = ? "
+        "AND consumed_at IS NULL AND expires_at > ? "
+        "ORDER BY id DESC LIMIT 1",
+        (chain_id, token_id, at),
+    ).fetchone()
+    return _reservation_from_row(row) if row else None
+
+
+def count_active_reservations(
+    conn: sqlite3.Connection, subject: str, now: datetime | None = None
+) -> int:
+    """某链末端 subject 当前有效（未过期、未消费）的预留份数。
+
+    与额度 / 已用量同一事务内读取：预留、核销、额度调整均以
+    ``BEGIN IMMEDIATE`` 串行化，可用量（limit - used - reserved）不会超发。
+    """
+    at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM quota_reservations "
+        "WHERE subject = ? AND consumed_at IS NULL AND expires_at > ?",
+        (subject, at),
+    ).fetchone()
+    return int(row["n"])
+
+
+def mark_reservation_consumed(
+    conn: sqlite3.Connection,
+    reservation_key: str,
+    consumed_at: datetime,
+    redemption_request_key: str,
+) -> None:
+    """把预留标记为已消费（转为已用）：与成功核销记录在同一事务内提交。
+
+    只回填消费标记，不改写预留的访问内容、有效期与首次响应（重放仍返回原结果）。
+    """
+    conn.execute(
+        "UPDATE quota_reservations SET consumed_at = ?, redemption_request_key = ? "
+        "WHERE reservation_key = ?",
+        (
+            consumed_at.astimezone(timezone.utc).isoformat(),
+            redemption_request_key,
+            reservation_key,
+        ),
+    )
+
+
+def _reservation_from_row(row: sqlite3.Row) -> ReservationEvent:
+    consumed_at = row["consumed_at"]
+    return ReservationEvent(
+        reservation_key=row["reservation_key"],
+        chain_id=row["chain_id"],
+        token_id=row["token_id"],
+        subject=row["subject"],
+        request_path=row["request_path"],
+        method=row["method"],
+        source_ip=row["source_ip"],
+        request_body=json.loads(row["request_body"]),
+        access_sha256=row["access_sha256"],
+        content_sha256=row["content_sha256"],
+        ttl_seconds=row["ttl_seconds"],
+        evaluated_at=datetime.fromisoformat(row["evaluated_at"]),
+        expires_at=datetime.fromisoformat(row["expires_at"]),
+        created_at=datetime.fromisoformat(row["created_at"]),
+        consumed_at=datetime.fromisoformat(consumed_at) if consumed_at else None,
+        redemption_request_key=row["redemption_request_key"],
+    )
