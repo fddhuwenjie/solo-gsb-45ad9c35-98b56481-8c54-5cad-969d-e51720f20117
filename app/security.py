@@ -120,10 +120,13 @@ def canonical_redemption_hash(
     method: str,
     source_ip: str | None,
     body: Any,
+    reservation_key: str | None = None,
 ) -> str:
     """核销请求内容指纹：同 request_key 同内容重放、换内容冲突均据此判定。
 
     判定时间（服务端接收时刻）不参与指纹——重放时一律返回首次结果。
+    仅当携带 ``reservation_key`` 时才把它并入指纹：不带预留键的旧调用算出的
+    指纹与引入预留前逐比特一致，既有核销记录的重放 / 冲突判定不受影响。
     """
     payload = {
         "chain_id": chain_id,
@@ -133,6 +136,36 @@ def canonical_redemption_hash(
         "method": method,
         "source_ip": source_ip,
         "body": body,
+    }
+    if reservation_key is not None:
+        payload["reservation_key"] = reservation_key
+    return sha256_hex(canonical_json(payload).encode("utf-8"))
+
+
+def canonical_reservation_hash(
+    chain_id: str,
+    token_id: str,
+    reservation_key: str,
+    request_path: str,
+    method: str,
+    source_ip: str | None,
+    body: Any,
+    ttl_seconds: int,
+) -> str:
+    """预留请求内容指纹：同 reservation_key 同内容重放、换内容冲突均据此判定。
+
+    有效秒数属于预留内容（同键换秒数即冲突）；到期时刻由服务端按接收时刻
+    推算，不参与指纹。
+    """
+    payload = {
+        "chain_id": chain_id,
+        "token_id": token_id,
+        "reservation_key": reservation_key,
+        "request_path": request_path,
+        "method": method,
+        "source_ip": source_ip,
+        "body": body,
+        "ttl_seconds": ttl_seconds,
     }
     return sha256_hex(canonical_json(payload).encode("utf-8"))
 

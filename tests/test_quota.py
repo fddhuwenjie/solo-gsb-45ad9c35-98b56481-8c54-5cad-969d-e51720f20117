@@ -202,7 +202,9 @@ def test_quota_set_to_zero_blocks_all_redemptions_when_unused(client):
         "subject": s,
         "limit": 0,
         "used": 0,
+        "reserved": 0,
         "remaining": 0,
+        "available": 0,
         "updated_at": data["quota"]["updated_at"],
     }
     # 令牌与 request_key 均未被消耗

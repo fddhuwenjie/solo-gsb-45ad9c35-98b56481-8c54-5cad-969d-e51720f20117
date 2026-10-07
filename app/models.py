@@ -187,11 +187,21 @@ class EvaluateRequest(RequestContext):
 
 
 class RedeemRequest(RequestContext):
-    """一次性访问核销请求；判定时间由服务端以接收时刻重算（请求体不提供时间）。"""
+    """一次性访问核销请求；判定时间由服务端以接收时刻重算（请求体不提供时间）。
+
+    可携带 ``reservation_key`` 使用事先预留的额度份额：仅当该令牌持有同键、
+    同访问内容且未过期的有效预留时才核销（预留在同一事务内转为已用）；
+    不带预留键的普通核销不得占用被预留的令牌与预留份额。
+    """
 
     token_id: str = Field(min_length=1, description="被核销的令牌 id；必须为链末端")
     request_key: str = Field(
         min_length=1, description="客户端幂等键；同键内容必须一致"
+    )
+    reservation_key: str | None = Field(
+        default=None,
+        min_length=1,
+        description="可选：事先预留额度的预留键；提供后即成为核销内容的一部分",
     )
 
 
@@ -376,20 +386,32 @@ class QuotaIn(BaseModel):
 
 
 class QuotaStatus(BaseModel):
-    """某链末端 subject 的额度口径：额度、已用量、剩余量。
+    """某链末端 subject 的额度口径：额度、已用量、有效预留与可用量。
 
-    - ``limit`` 为 null 表示未设置额度（不限额），此时 ``remaining`` 也为 null；
+    - ``limit`` 为 null 表示未设置额度（不限额），此时 ``remaining`` / ``available``
+      也为 null；
     - ``used`` 为该主体在全部链上的成功单链核销数，加上会签中该主体参与一侧
       的次数（每笔会签对每个参与主体计一次）——包含额度设置之前的历史成功核销，
       且追溯撤销 / 停用密钥不退还历史用量；
+    - ``reserved`` 为该主体当前**有效预留**数（未过期、尚未转为核销的短时预留，
+      每笔预留占一份额度；过期自动释放）；
+    - ``remaining`` = ``limit - used``（毛剩余，含已被预留的份额）；
+    - ``available`` = ``limit - used - reserved``（普通核销 / 会签 / 新预留
+      实际可用的份额）；
     - 口径持久化在数据库中，服务重启后不变。
     """
 
     subject: str = Field(description="链末端被授权主体名（额度按主体跨链累计）")
     limit: int | None = Field(description="成功核销总额度；null=未设置额度（不限额）")
-    used: int = Field(description="已用量：成功单链核销 + 会签参与侧（每次算一次）")
+    used: int = Field(description="历史已用量：成功单链核销 + 会签参与侧（每次算一次）")
+    reserved: int = Field(
+        default=0, description="有效预留数：未过期且未转为核销的短时预留（每笔占一份）"
+    )
     remaining: int | None = Field(
-        description="剩余量 = limit - used；未设置额度（不限额）时为 null"
+        description="毛剩余量 = limit - used（含被预留的份额）；未设置额度时为 null"
+    )
+    available: int | None = Field(
+        description="可用量 = limit - used - reserved；未设置额度（不限额）时为 null"
     )
     updated_at: datetime | None = Field(
         default=None,
@@ -424,19 +446,84 @@ class RedeemResult(BaseModel):
     first_revoked_node: str | None = None
     trace: list[NodeTrace]
     # 链末端 subject 成功核销总额度在“判定允许”后的结论：
-    # quota_exhausted=额度已满（可核销的其他条件全部满足，但本次不核销）；
-    # null=未设置额度（不限额），或判定本身已被既有授权 / 撤销 / 停用检查拒绝
-    # （按约定只有可成功核销时才检查余额，那种情况下不做余额判定）。
-    deny_reason: Literal["quota_exhausted"] | None = None
+    # quota_exhausted=可用额度（limit - used - reserved）已满（可核销的其他条件
+    # 全部满足，但本次不核销）；null=未设置额度（不限额），或判定本身已被既有
+    # 授权 / 撤销 / 停用检查拒绝（按约定只有可成功核销时才检查余额）。
+    # 预留相关的拒绝（发生在授权判定之前，不计已用、不占核销键）：
+    # token_reserved=目标令牌持有有效预留，普通核销不得占用（须携带对应预留键）；
+    # reservation_mismatch=携带的预留键不存在 / 已过期，或链、令牌、访问内容
+    # （路径 / 方法 / 来源 IP / 请求体）与预留不符。
+    deny_reason: Literal[
+        "quota_exhausted", "token_reserved", "reservation_mismatch"
+    ] | None = None
     # 本次所检查的链末端 subject 额度口径（仅在判定允许、进行了余额检查时返回）。
     # 成功核销后为扣减后的口径；余额不足拒绝时为拒绝瞬间的口径（已用量未变）；
     # 未设置额度（不限额）或未进行余额检查时为 null。
     quota: QuotaStatus | None = None
 
 
+class ReserveRequest(RequestContext):
+    """短时额度预留请求：为一次单链访问预先占一份额度（有效秒数 1～300）。
+
+    判定时间由服务端以接收时刻重算（请求体不提供时间）；仅在主体已设额度、
+    授权允许、令牌未核销且可用额度充足时占一份，返回到期时间。
+    """
+
+    token_id: str = Field(min_length=1, description="预留针对的令牌 id；必须为链末端")
+    reservation_key: str = Field(
+        min_length=1, description="客户端幂等键；同键内容必须一致（仅有效预留占用）"
+    )
+    ttl_seconds: int = Field(
+        ge=1, le=300, description="预留有效秒数（1～300）；到期自动释放"
+    )
+
+
+class ReservationEvent(BaseModel):
+    """短时额度预留记录（成功预留才落库；过期自动释放，核销成功后转为已用删除）。"""
+
+    chain_id: str
+    token_id: str
+    reservation_key: str
+    subject: str = Field(description="预留时锁定的链末端 subject（额度按主体统计）")
+    request_path: str
+    method: str
+    source_ip: str | None
+    request_body: Any
+    content_sha256: str = Field(description="预留请求规范化内容指纹，用于重放/冲突判定")
+    created_at: datetime = Field(description="预留落库时间（UTC）")
+    expires_at: datetime = Field(description="预留到期时间（UTC）；过期自动释放")
+
+
+class ReservationResult(BaseModel):
+    """预留接口响应：无论是否预留成功都返回完整判定轨迹。"""
+
+    chain_id: str
+    token_id: str
+    reservation_key: str
+    reserved: bool
+    # 200：reservation_key 重放（同键同内容）；201：首次成功预留
+    replayed: bool = False
+    evaluated_at: datetime = Field(description="服务端接收时刻（UTC），即判定时间")
+    expires_at: datetime | None = Field(
+        default=None, description="预留到期时间（UTC）；预留失败时为 null"
+    )
+    decision: Literal["allow", "deny"]
+    first_failed_node: str | None
+    first_failed_reason: str | None
+    body_sha256: str
+    first_revoked_node: str | None = None
+    trace: list[NodeTrace]
+    # 授权判定允许后的额度结论：quota_unset=主体未设额度（预留要求已设额度）；
+    # quota_exhausted=可用额度（limit - used - reserved）不足；
+    # null=预留成功，或判定本身已被既有授权 / 撤销 / 停用检查拒绝（不查额度）。
+    deny_reason: Literal["quota_unset", "quota_exhausted"] | None = None
+    # 链末端 subject 的额度口径（仅在判定允许、进行了额度检查时返回）；
+    # 预留成功后为占用一份后的口径。
+    quota: QuotaStatus | None = None
+
+
 class CoRedemptionEvent(BaseModel):
     """双主体会签核销记录（两侧同时成功才落库；只追加、不可变）。"""
-
     request_key: str
     primary_chain_id: str
     primary_token_id: str
@@ -484,10 +571,12 @@ class CoRedeemLegResult(BaseModel):
     first_failed_reason: str | None
     first_revoked_node: str | None = None
     trace: list[NodeTrace]
-    # 既有授权 / 撤销 / 停用检查全部通过（decision=allow）后才进行的余额检查：
-    # 该侧主体额度不足时为 quota_exhausted——本次会签两侧均不核销、不占键；
-    # null=未设置额度（不限额），或该侧未通过既有检查（未到余额检查环节）。
-    deny_reason: Literal["quota_exhausted"] | None = None
+    # 既有授权 / 撤销 / 停用检查全部通过（decision=allow）后才进行的余额与预留检查：
+    # 该侧主体可用额度不足时为 quota_exhausted；该侧末端令牌持有有效预留时为
+    # token_reserved（会签不得占用被预留的令牌）——两种情况下本次会签两侧均不
+    # 核销、不占键；null=未设置额度（不限额）且令牌无有效预留，或该侧未通过
+    # 既有检查（未到余额 / 预留检查环节）。
+    deny_reason: Literal["quota_exhausted", "token_reserved"] | None = None
     # 该侧末端 subject 的额度口径（仅在该侧判定允许、进行了余额检查时返回）；
     # 会签成功后为扣减后的口径；余额不足（任一侧）时为拒绝瞬间的口径；
     # 未设置额度或未进行余额检查时为 null。

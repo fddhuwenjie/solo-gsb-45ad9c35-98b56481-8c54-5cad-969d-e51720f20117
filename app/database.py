@@ -18,6 +18,7 @@ from .models import (
     KeyDeactivationEvent,
     QuotaStatus,
     RedemptionEvent,
+    ReservationEvent,
     RevocationEvent,
     RevocationImpact,
 )
@@ -176,6 +177,29 @@ CREATE TABLE IF NOT EXISTS redemption_quotas (
     subject    TEXT PRIMARY KEY,
     limit_value INTEGER,
     updated_at TEXT NOT NULL
+);
+
+-- 短时额度预留：为一次单链访问预先占一份额度（有效秒数 1～300，到期自动释放）。
+-- reservation_key 全局唯一（仅有效预留占用；过期 / 转为核销后键即释放）；
+-- 同一链内同一令牌至多一行——即同一令牌只能有一笔有效预留（过期行由应用层
+-- 惰性清除后允许新预留）。预留不单独记已用：核销成功时同事务删除预留行，
+-- 由 redemptions 计入已用量，份额从“预留”转为“已用”，可用量不变。
+CREATE TABLE IF NOT EXISTS reservations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    chain_id        TEXT NOT NULL,
+    token_id        TEXT NOT NULL,
+    reservation_key TEXT NOT NULL UNIQUE,
+    subject         TEXT NOT NULL,
+    request_path    TEXT NOT NULL,
+    method          TEXT NOT NULL,
+    source_ip       TEXT,
+    request_body    TEXT,
+    content_sha256  TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    expires_at      TEXT NOT NULL,
+    result_json     TEXT NOT NULL,
+    UNIQUE (chain_id, token_id),
+    FOREIGN KEY (chain_id) REFERENCES chains (chain_id)
 );
 """
 
@@ -1073,18 +1097,29 @@ def load_quota_row(
     return row["limit_value"], datetime.fromisoformat(row["updated_at"])
 
 
-def get_quota_status(conn: sqlite3.Connection, subject: str) -> QuotaStatus:
-    """组装主体的额度口径（额度 / 已用量 / 剩余量）；未设置额度时 limit 为 None。"""
+def get_quota_status(
+    conn: sqlite3.Connection, subject: str, at: datetime | None = None
+) -> QuotaStatus:
+    """组装主体的额度口径（额度 / 已用量 / 有效预留 / 可用量）。
+
+    ``reserved`` 只统计 ``expires_at`` 晚于 ``at``（缺省为当前时刻）的预留——
+    过期预留自动释放，不再占份额；``available = limit - used - reserved``
+    （未设置额度时 ``limit`` / ``remaining`` / ``available`` 均为 None）。
+    """
     row = load_quota_row(conn, subject)
     limit = row[0] if row is not None else None
     updated_at = row[1] if row is not None else None
     used = count_subject_redemption_usage(conn, subject)
+    reserved = count_active_reservations(conn, subject, at)
     remaining = None if limit is None else limit - used
+    available = None if limit is None else limit - used - reserved
     return QuotaStatus(
         subject=subject,
         limit=limit,
         used=used,
+        reserved=reserved,
         remaining=remaining,
+        available=available,
         updated_at=updated_at,
     )
 
@@ -1110,3 +1145,107 @@ def upsert_quota(
         (subject, limit, updated_at.astimezone(timezone.utc).isoformat()),
     )
     return previous_limit
+
+
+# --------------------------------------------------------------------------- #
+# 短时额度预留（成功预留才落库；过期自动释放，核销成功后转为已用删除）
+# --------------------------------------------------------------------------- #
+_RESERVATION_COLUMNS = (
+    "chain_id, token_id, reservation_key, subject, request_path, method, "
+    "source_ip, request_body, content_sha256, created_at, expires_at"
+)
+
+
+def load_reservation_by_key(
+    conn: sqlite3.Connection, reservation_key: str
+) -> tuple[ReservationEvent, str] | None:
+    """返回（预留事件, 首次响应 JSON）；未见过该 reservation_key 时返回 None。
+
+    调用方须自行按 ``expires_at`` 判定预留是否仍有效：过期预留视为已释放
+    （键与令牌都不再被占用），由写事务内的调用方惰性清除。
+    """
+    row = conn.execute(
+        f"SELECT {_RESERVATION_COLUMNS}, result_json FROM reservations "
+        "WHERE reservation_key = ?",
+        (reservation_key,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _reservation_from_row(row), row["result_json"]
+
+
+def load_reservation_for_token(
+    conn: sqlite3.Connection, chain_id: str, token_id: str
+) -> ReservationEvent | None:
+    """该令牌当前的预留记录（同一令牌至多一行，即至多一笔有效预留）。
+
+    不过滤过期：是否仍有效由调用方按 ``expires_at`` 判定（过期即视为释放）。
+    """
+    row = conn.execute(
+        f"SELECT {_RESERVATION_COLUMNS} FROM reservations "
+        "WHERE chain_id = ? AND token_id = ?",
+        (chain_id, token_id),
+    ).fetchone()
+    return _reservation_from_row(row) if row else None
+
+
+def insert_reservation(
+    conn: sqlite3.Connection, event: ReservationEvent, result_json: str
+) -> None:
+    """追加一条预留记录；唯一约束冲突时抛 sqlite3.IntegrityError。"""
+    conn.execute(
+        "INSERT INTO reservations (chain_id, token_id, reservation_key, subject, "
+        "request_path, method, source_ip, request_body, content_sha256, "
+        "created_at, expires_at, result_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            event.chain_id,
+            event.token_id,
+            event.reservation_key,
+            event.subject,
+            event.request_path,
+            event.method,
+            event.source_ip,
+            json.dumps(event.request_body, ensure_ascii=False),
+            event.content_sha256,
+            event.created_at.astimezone(timezone.utc).isoformat(),
+            event.expires_at.astimezone(timezone.utc).isoformat(),
+            result_json,
+        ),
+    )
+
+
+def delete_reservation(conn: sqlite3.Connection, reservation_key: str) -> None:
+    """删除一条预留（过期惰性释放，或核销成功后把份额转为已用）。"""
+    conn.execute(
+        "DELETE FROM reservations WHERE reservation_key = ?", (reservation_key,)
+    )
+
+
+def count_active_reservations(
+    conn: sqlite3.Connection, subject: str, at: datetime | None = None
+) -> int:
+    """某主体当前的有效预留数（``expires_at`` 晚于 ``at``；过期自动释放）。"""
+    moment = (at or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM reservations "
+        "WHERE subject = ? AND expires_at > ?",
+        (subject, moment.isoformat()),
+    ).fetchone()
+    return int(row["n"])
+
+
+def _reservation_from_row(row: sqlite3.Row) -> ReservationEvent:
+    return ReservationEvent(
+        chain_id=row["chain_id"],
+        token_id=row["token_id"],
+        reservation_key=row["reservation_key"],
+        subject=row["subject"],
+        request_path=row["request_path"],
+        method=row["method"],
+        source_ip=row["source_ip"],
+        request_body=json.loads(row["request_body"]),
+        content_sha256=row["content_sha256"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+        expires_at=datetime.fromisoformat(row["expires_at"]),
+    )
